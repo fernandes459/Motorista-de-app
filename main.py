@@ -4,7 +4,8 @@ from supabase import create_client, Client # Importa Client para type hinting
 from dotenv import load_dotenv
 import os
 from twilio.twiml.messaging_response import MessagingResponse # Importa para construir respostas TwiML (XML)
-import datetime # Importa para trabalhar com datas (para o campo 'data' nos gastos)
+import datetime # Importa para trabalhar com datas (para o campo 'data' nas transacoes)
+import traceback # Importa para obter o rasto de erro completo
 
 # Carregar variáveis de ambiente do arquivo .env (para uso local)
 # No Render, essas variáveis são fornecidas pelo painel, mas load_dotenv é bom para testes locais.
@@ -40,7 +41,7 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
     try:
         # Lógica para o comando "INICIAR"
         if user_msg == "iniciar":
-            # Verifica se o motorista já está cadastrado
+            # Verificar se o motorista já está cadastrado
             response_data, count = supabase.table('motoristas').select('whatsapp').eq('whatsapp', whatsapp_number).limit(1).execute()
             
             if response_data and response_data[1]: # Verifica se a lista de dados não está vazia
@@ -69,12 +70,12 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
                     if valor <= 0:
                         twilio_response.message("❌ O valor do gasto deve ser maior que zero.")
                     else:
-                        # Verifica se o motorista está cadastrado antes de registrar o gasto
+                        # Verificar se o motorista está cadastrado antes de registrar o gasto
                         motorista_data, motorista_count = supabase.table('motoristas').select('id').eq('whatsapp', whatsapp_number).limit(1).execute()
                         
                         if motorista_data and motorista_data[1]:
-                            # Insere o gasto na tabela 'gastos'
-                            insert_gasto_data, count_gasto = supabase.table('gastos').insert({
+                            # Insere a transação na tabela 'transacoes' (NÃO 'gastos')
+                            insert_transacao_data, count_transacao = supabase.table('transacoes').insert({ # ALTERADO AQUI
                                 "whatsapp": whatsapp_number,
                                 "valor": valor,
                                 "descricao": descricao,
@@ -86,29 +87,30 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
                 except ValueError:
                     twilio_response.message("❌ Valor inválido. Por favor, use um número. Ex: GASTO 50.50 ALMOCO")
                 except Exception as e:
-                    # Captura erros gerais durante o processo de gasto
+                    # Captura erros gerais durante o processo de gasto e imprime o traceback
                     print(f"Erro ao registrar gasto: {e}")
+                    print(traceback.format_exc()) # Imprime o traceback completo para depuração
                     twilio_response.message("❌ Ocorreu um erro ao tentar registrar seu gasto. Tente novamente mais tarde.")
 
         # Lógica para o comando "RELATORIO"
         elif user_msg == "relatorio":
-            # Busca os gastos do motorista
-            response_data, count = supabase.table('gastos').select('valor', 'descricao', 'data').eq('whatsapp', whatsapp_number).order('data', desc=True).execute()
+            # Busca as transacoes do motorista (NÃO 'gastos')
+            response_data, count = supabase.table('transacoes').select('valor', 'descricao', 'data').eq('whatsapp', whatsapp_number).order('data', desc=True).execute() # ALTERADO AQUI
             
             if response_data and response_data[1]:
-                gastos = response_data[1]
-                total_gastos = sum(g['valor'] for g in gastos)
+                transacoes = response_data[1]
+                total_transacoes = sum(t['valor'] for t in transacoes)
                 
-                relatorio_message = "📊 Seu relatório de gastos:\n\n"
-                for gasto in gastos:
+                relatorio_message = "📊 Seu relatório de transações:\n\n"
+                for transacao in transacoes:
                     # Formata a data para melhor leitura
-                    data_obj = datetime.datetime.fromisoformat(gasto['data'])
-                    relatorio_message += f"• R${gasto['valor']:.2f} em {data_obj.strftime('%d/%m/%Y %H:%M')} ({gasto['descricao']})\n"
+                    data_obj = datetime.datetime.fromisoformat(transacao['data'])
+                    relatorio_message += f"• R${transacao['valor']:.2f} em {data_obj.strftime('%d/%m/%Y %H:%M')} ({transacao['descricao']})\n"
                 
-                relatorio_message += f"\nTotal: R${total_gastos:.2f}"
+                relatorio_message += f"\nTotal: R${total_transacoes:.2f}"
                 twilio_response.message(relatorio_message)
             else:
-                twilio_response.message("Você ainda não possui gastos registrados. Registre um com: GASTO <VALOR> <DESCRICAO>")
+                twilio_response.message("Você ainda não possui transações registradas. Registre uma com: GASTO <VALOR> <DESCRICAO>")
         
         # Comando não reconhecido
         else:
@@ -122,6 +124,7 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
     except Exception as e:
         # Loga o erro para depuração no Render
         print(f"Erro inesperado no webhook: {e}")
+        print(traceback.format_exc()) # Imprime o traceback completo para depuração
         # Envia uma mensagem de erro genérica para o usuário
         twilio_response.message(f"❌ Ocorreu um erro interno no sistema. Por favor, tente novamente mais tarde.")
 
@@ -132,4 +135,3 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
