@@ -76,13 +76,14 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
                         if motorista_response and motorista_response[1]:
                             motorista_id = motorista_response[1][0]['id'] # Pega o 'id' do motorista
                             
-                            # 2. Insere a transação na tabela 'transacoes' (NÃO 'gastos') com o ID do usuário
+                            # 2. Insere a transação na tabela 'transacoes' com o ID do usuário
                             insert_transacao_data, count_transacao = supabase.table('transacoes').insert({
                                 "whatsapp": whatsapp_number,
                                 "valor": valor,
                                 "descricao": descricao,
                                 "data": datetime.datetime.now().isoformat(), # Grava a data/hora atual
-                                "id_do_usuario": motorista_id # CORRIGIDO: Agora usa 'id_do_usuario' (snake_case)
+                                # ESTA É A LINHA CRÍTICA! Usando o nome EXATO da coluna do Supabase.
+                                "ID do usuário": motorista_id 
                             }).execute()
                             twilio_response.message(f"💰 Gasto de R${valor:.2f} para '{descricao}' registrado com sucesso!")
                         else:
@@ -97,7 +98,7 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
 
         # Lógica para o comando "RELATORIO"
         elif user_msg == "relatorio":
-            # Busca as transacoes do motorista (NÃO 'gastos')
+            # Busca as transacoes do motorista
             response_data, count = supabase.table('transacoes').select('valor', 'descricao', 'data').eq('whatsapp', whatsapp_number).order('data', desc=True).execute()
             
             if response_data and response_data[1]:
