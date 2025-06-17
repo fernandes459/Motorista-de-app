@@ -1,64 +1,135 @@
-from fastapi import FastAPI, Request, Response
-from supabase import create_client
-import os
+# Importações necessárias
+from fastapi import FastAPI, Request, Response, Form # Importa Form para lidar com dados de formulário do Twilio
+from supabase import create_client, Client # Importa Client para type hinting
 from dotenv import load_dotenv
+import os
+from twilio.twiml.messaging_response import MessagingResponse # Importa para construir respostas TwiML (XML)
+import datetime # Importa para trabalhar com datas (para o campo 'data' nos gastos)
 
-# Configurações iniciais
+# Carregar variáveis de ambiente do arquivo .env (para uso local)
+# No Render, essas variáveis são fornecidas pelo painel, mas load_dotenv é bom para testes locais.
 load_dotenv()
 
+# Inicializa a aplicação FastAPI
 app = FastAPI()
 
-# Conexão com Supabase (versão compatível)
-supabase = create_client(
-    supabase_url=os.getenv("SUPABASE_URL"),
-    supabase_key=os.getenv("SUPABASE_KEY")
-)
+# Configurações do Supabase (obtidas das variáveis de ambiente)
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+# Inicializa o cliente Supabase
+# É crucial que SUPABASE_URL e SUPABASE_KEY estejam corretas e com valores completos.
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Rota de health check - para o Render saber que a API está funcionando
+@app.get("/")
+async def root():
+    return {"message": "API Driverscash está funcionando!"}
+
+# Rota para receber as mensagens do WhatsApp (Webhook)
 @app.post("/webhook")
-async def whatsapp_webhook(request: Request):
+async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
+    # Inicializa um objeto MessagingResponse para construir a resposta TwiML
+    twilio_response = MessagingResponse()
+    
+    # Processa a mensagem do usuário
+    user_msg_raw = Body.strip() # Remove espaços extras no início/fim
+    user_msg = user_msg_raw.lower() # Converte para minúsculas para comparação de comandos
+    whatsapp_number = From.replace("whatsapp:", "") # Remove o prefixo "whatsapp:" do número
+
     try:
-        # Recebe dados do WhatsApp
-        form_data = await request.form()
-        user_msg = form_data.get('Body', '').lower()
-        user_number = form_data.get('From', '')
-        
-        # Comandos disponíveis
-        if user_msg.startswith("iniciar"):
-            # Cadastra novo motorista
-            supabase.table("motoristas").insert({
-                "whatsapp": user_number,
-                "plano": "essencial"
-            }).execute()
+        # Lógica para o comando "INICIAR"
+        if user_msg == "iniciar":
+            # Verifica se o motorista já está cadastrado
+            response_data, count = supabase.table('motoristas').select('whatsapp').eq('whatsapp', whatsapp_number).limit(1).execute()
             
-            return Response("""
-            ✅ Cadastro realizado! Use:
-            • "GASTO 50 POSTO" - Registrar despesas
-            • "RELATORIO" - Ver seus dados
-            """)
-
-        elif user_msg.startswith("gasto"):
-            # Registra gastos (ex: "gasto 50 combustivel")
-            parts = user_msg.split()
-            if len(parts) >= 2:
-                supabase.table("gastos").insert({
-                    "whatsapp": user_number,
-                    "valor": float(parts[1]),
-                    "descricao": " ".join(parts[2:]) if len(parts) > 2 else "Não especificado"
-                }).execute()
-                return Response(f"✅ Gastos: R${parts[1]} - {' '.join(parts[2:])}")
+            if response_data and response_data[1]: # Verifica se a lista de dados não está vazia
+                twilio_response.message("Você já está cadastrado no Driverscash!")
             else:
-                return Response("⚠️ Formato incorreto. Use: GASTO [valor] [descrição]")
+                # Cadastra um novo motorista
+                insert_data, count = supabase.table('motoristas').insert({"whatsapp": whatsapp_number, "plano": "essencial"}).execute()
+                twilio_response.message(
+                    "✅ Cadastro realizado! Use:\n"
+                    "• \"GASTO 50.00 POSTO\" - Registrar despesas (use ponto para decimais)\n"
+                    "• \"RELATORIO\" - Ver seus dados"
+                )
+        
+        # Lógica para o comando "GASTO"
+        elif user_msg.startswith("gasto "):
+            parts = user_msg_raw.split(" ", 2) # Divide em no máximo 3 partes: 'gasto', 'valor', 'descrição'
+            
+            if len(parts) < 3: # Verifica se tem pelo menos valor e descrição
+                twilio_response.message("❌ Formato incorreto para registrar gasto. Use: GASTO <VALOR> <DESCRICAO> (ex: GASTO 50.00 COMBUSTIVEL)")
+            else:
+                try:
+                    # Tenta converter o valor para float, aceitando vírgula ou ponto como decimal
+                    valor = float(parts[1].replace(",", "."))
+                    descricao = parts[2].strip() # Pega a descrição e remove espaços extras
+                    
+                    if valor <= 0:
+                        twilio_response.message("❌ O valor do gasto deve ser maior que zero.")
+                    else:
+                        # Verifica se o motorista está cadastrado antes de registrar o gasto
+                        motorista_data, motorista_count = supabase.table('motoristas').select('id').eq('whatsapp', whatsapp_number).limit(1).execute()
+                        
+                        if motorista_data and motorista_data[1]:
+                            # Insere o gasto na tabela 'gastos'
+                            insert_gasto_data, count_gasto = supabase.table('gastos').insert({
+                                "whatsapp": whatsapp_number,
+                                "valor": valor,
+                                "descricao": descricao,
+                                "data": datetime.datetime.now().isoformat() # Grava a data/hora atual
+                            }).execute()
+                            twilio_response.message(f"💰 Gasto de R${valor:.2f} para '{descricao}' registrado com sucesso!")
+                        else:
+                            twilio_response.message("❌ Você precisa se cadastrar primeiro para registrar gastos! Envie 'INICIAR'.")
+                except ValueError:
+                    twilio_response.message("❌ Valor inválido. Por favor, use um número. Ex: GASTO 50.50 ALMOCO")
+                except Exception as e:
+                    # Captura erros gerais durante o processo de gasto
+                    print(f"Erro ao registrar gasto: {e}")
+                    twilio_response.message("❌ Ocorreu um erro ao tentar registrar seu gasto. Tente novamente mais tarde.")
 
+        # Lógica para o comando "RELATORIO"
+        elif user_msg == "relatorio":
+            # Busca os gastos do motorista
+            response_data, count = supabase.table('gastos').select('valor', 'descricao', 'data').eq('whatsapp', whatsapp_number).order('data', desc=True).execute()
+            
+            if response_data and response_data[1]:
+                gastos = response_data[1]
+                total_gastos = sum(g['valor'] for g in gastos)
+                
+                relatorio_message = "📊 Seu relatório de gastos:\n\n"
+                for gasto in gastos:
+                    # Formata a data para melhor leitura
+                    data_obj = datetime.datetime.fromisoformat(gasto['data'])
+                    relatorio_message += f"• R${gasto['valor']:.2f} em {data_obj.strftime('%d/%m/%Y %H:%M')} ({gasto['descricao']})\n"
+                
+                relatorio_message += f"\nTotal: R${total_gastos:.2f}"
+                twilio_response.message(relatorio_message)
+            else:
+                twilio_response.message("Você ainda não possui gastos registrados. Registre um com: GASTO <VALOR> <DESCRICAO>")
+        
+        # Comando não reconhecido
         else:
-            return Response("""
-            ⚠️ Comando inválido. Opções:
-            • INICIAR - Começar cadastro
-            • GASTO [valor] [motivo]
-            """)
+            twilio_response.message(
+                "⚠️ Comando inválido. Opções:\n"
+                "• INICIAR - Começar cadastro\n"
+                "• GASTO <VALOR> <DESCRICAO>\n"
+                "• RELATORIO"
+            )
 
     except Exception as e:
-        return Response(f"❌ Erro: {str(e)}")
+        # Loga o erro para depuração no Render
+        print(f"Erro inesperado no webhook: {e}")
+        # Envia uma mensagem de erro genérica para o usuário
+        twilio_response.message(f"❌ Ocorreu um erro interno no sistema. Por favor, tente novamente mais tarde.")
 
+    # Retorna a resposta TwiML (XML) para o Twilio
+    return Response(content=str(twilio_response), media_type="application/xml")
+
+# Ponto de entrada para execução local (não usado no Render, mas útil para testes)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
