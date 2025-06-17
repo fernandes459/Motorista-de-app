@@ -82,7 +82,7 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
                                 "valor": valor,
                                 "descricao": descricao,
                                 "data": datetime.datetime.now().isoformat(), # Grava a data/hora atual
-                                "ID do usuário": motorista_id # CORRIGIDO: Agora usa 'ID do usuário'
+                                "id_do_usuario": motorista_id # CORRIGIDO: Agora usa 'id_do_usuario' (snake_case)
                             }).execute()
                             twilio_response.message(f"💰 Gasto de R${valor:.2f} para '{descricao}' registrado com sucesso!")
                         else:
