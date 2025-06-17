@@ -76,13 +76,13 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
                         if motorista_response and motorista_response[1]:
                             motorista_id = motorista_response[1][0]['id'] # Pega o 'id' do motorista
                             
-                            # 2. Insere a transação na tabela 'transacoes' (NÃO 'gastos') com o user_id
+                            # 2. Insere a transação na tabela 'transacoes' (NÃO 'gastos') com o ID do usuário
                             insert_transacao_data, count_transacao = supabase.table('transacoes').insert({
                                 "whatsapp": whatsapp_number,
                                 "valor": valor,
                                 "descricao": descricao,
                                 "data": datetime.datetime.now().isoformat(), # Grava a data/hora atual
-                                "user_id": motorista_id # NOVO: Adiciona o user_id aqui
+                                "ID do usuário": motorista_id # CORRIGIDO: Agora usa 'ID do usuário'
                             }).execute()
                             twilio_response.message(f"💰 Gasto de R${valor:.2f} para '{descricao}' registrado com sucesso!")
                         else:
@@ -93,7 +93,7 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
                     # Captura erros gerais durante o processo de gasto e imprime o traceback
                     print(f"Erro ao registrar gasto: {e}")
                     print(traceback.format_exc()) # Imprime o traceback completo para depuração
-                    twilio_response.message("❌ Ocorreu um erro ao tentar registrar seu gasto. Tente novamente mais tarde.")
+                    twilio_response.message("❌ Ocorreu um erro ao tentar registrar seu gasto. Por favor, tente novamente mais tarde.")
 
         # Lógica para o comando "RELATORIO"
         elif user_msg == "relatorio":
