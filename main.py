@@ -70,16 +70,19 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
                     if valor <= 0:
                         twilio_response.message("❌ O valor do gasto deve ser maior que zero.")
                     else:
-                        # Verificar se o motorista está cadastrado antes de registrar o gasto
-                        motorista_data, motorista_count = supabase.table('motoristas').select('id').eq('whatsapp', whatsapp_number).limit(1).execute()
+                        # 1. VERIFICAR SE O MOTORISTA ESTÁ CADASTRADO E OBTER O ID
+                        motorista_response, motorista_count = supabase.table('motoristas').select('id').eq('whatsapp', whatsapp_number).limit(1).execute()
                         
-                        if motorista_data and motorista_data[1]:
-                            # Insere a transação na tabela 'transacoes' (NÃO 'gastos')
-                            insert_transacao_data, count_transacao = supabase.table('transacoes').insert({ # ALTERADO AQUI
+                        if motorista_response and motorista_response[1]:
+                            motorista_id = motorista_response[1][0]['id'] # Pega o 'id' do motorista
+                            
+                            # 2. Insere a transação na tabela 'transacoes' (NÃO 'gastos') com o user_id
+                            insert_transacao_data, count_transacao = supabase.table('transacoes').insert({
                                 "whatsapp": whatsapp_number,
                                 "valor": valor,
                                 "descricao": descricao,
-                                "data": datetime.datetime.now().isoformat() # Grava a data/hora atual
+                                "data": datetime.datetime.now().isoformat(), # Grava a data/hora atual
+                                "user_id": motorista_id # NOVO: Adiciona o user_id aqui
                             }).execute()
                             twilio_response.message(f"💰 Gasto de R${valor:.2f} para '{descricao}' registrado com sucesso!")
                         else:
@@ -95,7 +98,7 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
         # Lógica para o comando "RELATORIO"
         elif user_msg == "relatorio":
             # Busca as transacoes do motorista (NÃO 'gastos')
-            response_data, count = supabase.table('transacoes').select('valor', 'descricao', 'data').eq('whatsapp', whatsapp_number).order('data', desc=True).execute() # ALTERADO AQUI
+            response_data, count = supabase.table('transacoes').select('valor', 'descricao', 'data').eq('whatsapp', whatsapp_number).order('data', desc=True).execute()
             
             if response_data and response_data[1]:
                 transacoes = response_data[1]
