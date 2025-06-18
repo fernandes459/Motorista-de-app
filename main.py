@@ -22,6 +22,35 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 # É crucial que SUPABASE_URL e SUPABASE_KEY estejam corretas e com valores completos.
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# --- FUNÇÃO AUXILIAR PARA CATEGORIAS ---
+async def get_or_create_default_category_id():
+    """
+    Verifica se a categoria 'Outros' existe na tabela 'categorias_transacao'.
+    Se existir, retorna seu ID. Se não existir, cria e retorna o novo ID.
+    """
+    try:
+        # Tenta encontrar a categoria 'Outros'
+        response, count = await supabase.table('categorias_transacao').select('id').eq('nome', 'Outros').limit(1).execute()
+        
+        if response and response[1]: # Se a categoria for encontrada
+            return response[1][0]['id']
+        else: # Se a categoria 'Outros' não existir, cria ela
+            print("Categoria 'Outros' não encontrada, criando...")
+            insert_response, insert_count = await supabase.table('categorias_transacao').insert({"nome": "Outros"}).execute()
+            if insert_response and insert_response[1]:
+                print(f"Categoria 'Outros' criada com ID: {insert_response[1][0]['id']}")
+                return insert_response[1][0]['id']
+            else:
+                print("Erro: Não foi possível criar a categoria 'Outros'.")
+                # Log o erro completo para depuração no Render
+                print(f"Detalhes do erro de inserção da categoria: {insert_response}")
+                return None # Retorna None se a criação falhar
+    except Exception as e:
+        print(f"Erro inesperado ao buscar/criar categoria padrão: {e}")
+        print(traceback.format_exc())
+        return None
+
+
 # Rota de health check - para o Render saber que a API está funcionando
 @app.get("/")
 async def root():
@@ -42,13 +71,13 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
         # Lógica para o comando "INICIAR"
         if user_msg == "iniciar":
             # Verificar se o motorista já está cadastrado
-            response_data, count = supabase.table('motoristas').select('whatsapp').eq('whatsapp', whatsapp_number).limit(1).execute()
+            response_data, count = await supabase.table('motoristas').select('whatsapp').eq('whatsapp', whatsapp_number).limit(1).execute()
             
             if response_data and response_data[1]: # Verifica se a lista de dados não está vazia
                 twilio_response.message("Você já está cadastrado no Driverscash!")
             else:
                 # Cadastra um novo motorista
-                insert_data, count = supabase.table('motoristas').insert({"whatsapp": whatsapp_number, "plano": "essencial"}).execute()
+                insert_data, count = await supabase.table('motoristas').insert({"whatsapp": whatsapp_number, "plano": "essencial"}).execute()
                 twilio_response.message(
                     "✅ Cadastro realizado! Use:\n"
                     "• \"GASTO 50.00 POSTO\" - Registrar despesas (use ponto para decimais)\n"
@@ -71,21 +100,27 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
                         twilio_response.message("❌ O valor do gasto deve ser maior que zero.")
                     else:
                         # 1. VERIFICAR SE O MOTORISTA ESTÁ CADASTRADO E OBTER O ID
-                        motorista_response, motorista_count = supabase.table('motoristas').select('id').eq('whatsapp', whatsapp_number).limit(1).execute()
+                        motorista_response, motorista_count = await supabase.table('motoristas').select('id').eq('whatsapp', whatsapp_number).limit(1).execute()
                         
                         if motorista_response and motorista_response[1]:
                             motorista_id = motorista_response[1][0]['id'] # Pega o 'id' do motorista
                             
-                            # 2. Insere a transação na tabela 'transacoes' com o ID do usuário
-                            insert_transacao_data, count_transacao = supabase.table('transacoes').insert({
-                                "whatsapp": whatsapp_number,
-                                "valor": valor,
-                                "descricao": descricao,
-                                "data": datetime.datetime.now().isoformat(), # Grava a data/hora atual
-                                # ESTA É A LINHA CRÍTICA! Usando o nome REAL da coluna do Supabase.
-                                "user_id": motorista_id 
-                            }).execute()
-                            twilio_response.message(f"💰 Gasto de R${valor:.2f} para '{descricao}' registrado com sucesso!")
+                            # 2. Obtém o ID da categoria padrão 'Outros'
+                            default_category_id = await get_or_create_default_category_id() # AGUARDA a função assíncrona
+                            
+                            if default_category_id:
+                                # 3. Insere a transação na tabela 'transacoes'
+                                insert_transacao_data, count_transacao = await supabase.table('transacoes').insert({
+                                    "whatsapp": whatsapp_number,
+                                    "valor": valor,
+                                    "descricao": descricao,
+                                    "data": datetime.datetime.now().isoformat(), # Grava a data/hora atual
+                                    "user_id": motorista_id, 
+                                    "categoria_id": default_category_id # AGORA COM O ID DA CATEGORIA!
+                                }).execute()
+                                twilio_response.message(f"� Gasto de R${valor:.2f} para '{descricao}' registrado com sucesso!")
+                            else:
+                                twilio_response.message("❌ Erro interno: Não foi possível definir a categoria do gasto. Por favor, contate o suporte.")
                         else:
                             twilio_response.message("❌ Você precisa se cadastrar primeiro para registrar gastos! Envie 'INICIAR'.")
                 except ValueError:
@@ -99,7 +134,7 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
         # Lógica para o comando "RELATORIO"
         elif user_msg == "relatorio":
             # Busca as transacoes do motorista
-            response_data, count = supabase.table('transacoes').select('valor', 'descricao', 'data').eq('whatsapp', whatsapp_number).order('data', desc=True).execute()
+            response_data, count = await supabase.table('transacoes').select('valor', 'descricao', 'data').eq('whatsapp', whatsapp_number).order('data', desc=True).execute()
             
             if response_data and response_data[1]:
                 transacoes = response_data[1]
@@ -139,3 +174,4 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+�
