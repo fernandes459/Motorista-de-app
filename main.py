@@ -82,8 +82,8 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
                                 "valor": valor,
                                 "descricao": descricao,
                                 "data": datetime.datetime.now().isoformat(), # Grava a data/hora atual
-                                # ESTA É A LINHA CRÍTICA! Usando o nome EXATO da coluna do Supabase.
-                                "ID do usuário": motorista_id 
+                                # ESTA É A LINHA CRÍTICA! Usando o nome REAL da coluna do Supabase.
+                                "user_id": motorista_id 
                             }).execute()
                             twilio_response.message(f"💰 Gasto de R${valor:.2f} para '{descricao}' registrado com sucesso!")
                         else:
