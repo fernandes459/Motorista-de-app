@@ -36,796 +36,308 @@ if FIREBASE_CREDENTIALS_JSON_STR:
             firebase_admin.initialize_app(cred)
         print("Firebase Admin SDK initialized successfully.")
     except Exception as e:
-        print(f"Error initializing Firebase Admin SDK from environment variable: {e}")
-        print("Frontend authentication requiring Firebase Admin SDK may not work correctly.")
+        print(f"Error initializing Firebase Admin SDK: {e}")
+        # Depending on criticality, you might want to raise an exception or just log
+        # For this example, we'll allow the app to start but log the error
+        raise RuntimeError(f"Failed to initialize Firebase Admin SDK: {e}")
 else:
-    print("FIREBASE_CREDENTIALS_JSON environment variable not found. Frontend authentication requiring Firebase Admin SDK will not work.")
+    print("FIREBASE_CREDENTIALS_JSON environment variable not set. Firebase Admin SDK not initialized.")
 
+# --- Google Cloud Speech-to-Text Configuration (Optional, if you're using it) ---
+# Ensure GOOGLE_APPLICATION_CREDENTIALS environment variable is set on Render
+# if you are using file-based authentication.
+# For direct JSON content, consider loading similarly to Firebase if not using default GKE/Compute Engine roles.
 
-# Global __app_id variable from the Canvas environment
-# This will be used to construct Supabase paths according to the specified structure.
-# For local development, it defaults to 'default-app-id'.
-app_id = os.environ.get('__app_id', 'default-app-id')
-print(f"Using app_id: {app_id}")
-
-
-# --- Google Cloud Speech-to-Text Configuration ---
-# SpeechClient will automatically use GOOGLE_APPLICATION_CREDENTIALS if set,
-# or the default credentials configured for the environment (e.g., via gcloud auth application-default login)
-# Ensure Speech-to-Text API is enabled in your Google Cloud Project.
-speech_client = speech.SpeechClient()
-print("Google Speech-to-Text client initialized.")
-
-
-# --- Pydantic Models for API (Frontend) ---
-class RecordCreate(BaseModel):
-    # Model for creating new records (expense/income/KM)
-    type_of_record: str # Ex: "Despesa", "Receita", "KM"
-    category: str       # Ex: "Combustível", "Corrida", "Manutencao"
-    value: float
-    quantity: float | None = None # Optional quantity (for liters, etc.)
-    observations: str | None = None # Optional observations
+# --- Pydantic Models for Request Body Validation ---
+class Message(BaseModel):
+    To: str
+    From: str
+    Body: str = None # Mensagem de texto pode ser opcional se for áudio
+    MediaUrl0: str = None # URL do áudio, se for uma mensagem de áudio
 
 class ReminderCreate(BaseModel):
-    # Model for creating new maintenance reminders
-    maintenance_type: str # Ex: "Óleo", "Pneu", "Filtro"
-    target_km: float
+    maintenance_type: str
+    target_km: int
 
+class UserLogin(BaseModel):
+    token: str # Firebase ID Token
 
-# --- Dependency to get current user ID for API endpoints (Frontend) ---
+# --- Dependency to get authenticated user ID from Firebase ID Token ---
 async def get_current_user_id_from_auth(request: Request) -> str:
-    """
-    Authenticates the user based on the Firebase ID token provided in the Authorization header
-    and returns their Firebase UID.
-    """
     auth_header = request.headers.get("Authorization")
     if not auth_header:
-        print("DEBUG: Authorization header missing for API request.")
         raise HTTPException(status_code=401, detail="Authorization header missing")
-
-    token_parts = auth_header.split("Bearer ")
-    if len(token_parts) != 2:
-        print("DEBUG: Bearer token format invalid.")
-        raise HTTPException(status_code=401, detail="Bearer token missing or malformed")
-
-    token = token_parts[1]
-
-    if not firebase_admin._apps:
-        print("ERROR: Firebase Admin SDK not initialized. Cannot verify ID token.")
-        raise HTTPException(status_code=500, detail="Server authentication not configured.")
-
+    
+    token = auth_header.split("Bearer ")[1] if "Bearer " in auth_header else auth_header
+    
     try:
-        # Verify the Firebase ID token. This is the standard way to authenticate
-        # users on the backend when they send a token from the frontend.
         decoded_token = auth.verify_id_token(token)
         uid = decoded_token['uid']
-        print(f"DEBUG: Successfully authenticated user with UID: {uid}")
         return uid
     except Exception as e:
-        print(f"ERROR: Firebase ID token verification failed: {e}")
-        # Depending on the error, you might want more specific messages
-        raise HTTPException(status_code=401, detail=f"Invalid authentication token: {e}")
+        raise HTTPException(status_code=401, detail=f"Invalid or expired token: {e}")
 
-
-# --- Common Helper for Twilio XML Response ---
-def create_twiml_response(msg: str) -> Response:
-    """Helper function to create a Twilio TwiML XML response."""
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response><Message>{msg}</Message></Response>"""
-    print(f"DEBUG: TwiML response being sent: \n{twiml}")
-    return Response(content=twiml, media_type="application/xml")
-
-
-# NEW: Function to get or create a user in Supabase's 'usuários' table
-async def get_or_create_user(whatsapp_number: str) -> str:
+# --- NEW: Function to get or create a user in Supabase's 'usuarios' table ---
+async def get_or_create_user(whatsapp_number: str):
     """
-    Checks if a user exists in the 'usuários' table by their whatsapp_number.
-    If not, creates a new user entry. Returns the user's Supabase ID (uuid).
+    Checks if a user exists in the 'usuarios' table by their whatsapp_number.
+    If not, creates a new user entry. Returns the user's Supabase ID (UID).
     """
-    # Remove 'whatsapp:' prefix for cleaner storage/matching if desired, or keep as is.
-    # If your Supabase column stores 'whatsapp:+5511...' keep it as is.
-    # If it stores just '+5511...', you might want to remove the prefix here.
-    # Based on your image, it looks like 'numero_do_whatsapp' stores the full string.
     user_identifier = whatsapp_number 
 
-    print(f"Função get_or_create_user iniciada para o numero: {user_identifier}")
+    print(f"Função get_or_create_user iniciada para o número: {user_identifier}")
 
     try:
         # 1. Tentar encontrar o usuário existente
         # Ajuste 'usuarios' para o nome exato da sua tabela se for diferente (ex: 'users')
         # Ajuste 'numero_do_whatsapp' para o nome exato da sua coluna na tabela de usuários
-        # Sua tabela é 'usuários' e a coluna é 'numero_do_whatsapp'.
-        response = supabase.from_('usuários').select('uuid').eq('numero_do_whatsapp', user_identifier).limit(1).execute()
-        
-        if response.data and len(response.data) > 0:
-            user_uuid = response.data[0]['uuid']
-            print(f"DEBUG: Usuário existente encontrado: {user_uuid}")
-            return user_uuid
+        response = supabase.from_('usuarios').select('*').eq('número_do_whatsapp', user_identifier).limit(1).execute()
+        user_data = response.data
+
+        if user_data:
+            print(f"Usuário existente encontrado no Supabase: {user_data[0]}")
+            # Supondo que você queira retornar algum ID único do Supabase,
+            # como o 'id' da linha criada automaticamente pelo Supabase.
+            return user_data[0].get('id') # Retorna o ID da linha existente
         else:
             # 2. Se o usuário não existir, crie um novo
-            print(f"DEBUG: Usuário não encontrado, criando novo para {user_identifier}")
-            # Você precisa decidir o que 'uuid' será. Supabase pode gerar automaticamente
-            # se a coluna 'uuid' na sua tabela 'usuários' estiver configurada para
-            # `gen_random_uuid()` como seu valor padrão.
-            # Se você quer que o `uuid` seja o próprio `whatsapp_number`, use-o.
-            # Baseado na sua tabela, 'uuid' parece ser a PK.
-            # Vamos assumir que 'uuid' pode ser gerado pelo Supabase ou que o user_identifier pode servir
-            # Se 'uuid' for auto-gerado, não o inclua no insert.
-            # Se você quiser usar o whatsapp_number como uuid: {"uuid": user_identifier, "numero_do_whatsapp": user_identifier}
-            
-            # Considerando que 'uuid' é gerado automaticamente (melhor prática para PKs),
-            # ou que o Supabase lida com isso. Se não, você precisaria gerar um UUID aqui.
-            # Para o seu caso, apenas inserindo o 'numero_do_whatsapp' e deixando o 'uuid' ser gerado
-            # pelo DB, se configurado assim.
-            
-            # Sua tabela 'usuários' tem: id (PK), uuid, e-mail, senha_hashed, numero_do_whatsapp.
-            # 'id' e 'uuid' são geralmente auto-gerados. Inserimos o 'numero_do_whatsapp'.
-            
+            print(f"Usuário não encontrado. Criando novo usuário para: {user_identifier}")
             new_user_data = {
-                "numero_do_whatsapp": user_identifier
-                # Não incluir 'uuid' se ele for auto-gerado pelo Supabase
+                "número_do_whatsapp": user_identifier,
+                # Adicione aqui quaisquer outros campos obrigatórios para sua tabela 'usuarios'
+                # Por exemplo: "nome": "Novo Usuário", "email": "email_gerado@exemplo.com"
             }
+            insert_response = supabase.from_('usuarios').insert(new_user_data).execute()
             
-            # O .insert pode precisar de uma lista de dicionários se você estiver usando em outro contexto,
-            # mas para um único registro, um dicionário é OK.
-            insert_response = supabase.from_('usuários').insert(new_user_data).execute()
-            
-            if insert_response.data and len(insert_response.data) > 0:
-                # Se o UUID for retornado após a inserção (Supabase geralmente faz isso)
-                new_user_uuid = insert_response.data[0]['uuid']
-                print(f"DEBUG: Novo usuário criado com sucesso: {new_user_uuid}")
-                return new_user_uuid
+            if insert_response.data:
+                print(f"Novo usuário criado no Supabase: {insert_response.data[0]}")
+                return insert_response.data[0].get('id') # Retorna o ID da nova linha
             else:
-                raise Exception("Falha ao criar novo usuário no Supabase. Nenhuma data de retorno.")
+                print(f"ERRO: Nenhuma dado retornado após tentar criar usuário: {insert_response.data}")
+                raise HTTPException(status_code=500, detail="Erro ao criar novo usuário no Supabase: Nenhuma dado retornado")
 
     except Exception as e:
-        print(f"ERROR: Erro ao buscar ou criar usuário: {e}")
-        raise # Re-raise para que o fluxo superior possa lidar com isso
+        print(f"ERROR: Erro ao buscar ou criar usuário no Supabase: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro ao buscar ou criar usuário: {e}")
 
 
-# --- Root Endpoint for Health Check ---
-@app.get("/")
-async def read_root():
-    """Basic health check endpoint."""
-    return {"message": "Olá, Driverscash! Seu backend está funcionando e conectado ao Supabase."}
+# --- Helper for sending WhatsApp messages via Twilio ---
+def send_whatsapp_message(to: str, body: str):
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
+    twilio_whatsapp_number = os.environ.get("TWILIO_WHATSAPP_NUMBER")
 
+    if not account_sid or not auth_token or not twilio_whatsapp_number:
+        print("TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, or TWILIO_WHATSAPP_NUMBER not set.")
+        return
 
-# --- Test Endpoint for Supabase Connection ---
-@app.get("/test_supabase_connection")
-async def test_supabase_connection():
-    """Tests the Supabase connection by trying to fetch from a test table."""
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    data = {
+        "To": to,
+        "From": twilio_whatsapp_number,
+        "Body": body
+    }
+
     try:
-        # Attempt to fetch from a non-existent table or a simple query
-        # This checks if the client can communicate with the Supabase API.
-        response = supabase.from_('dummy_table').select('*').limit(0).execute()
-        print(f"DEBUG: Supabase test connection response: {response.status_code}")
-        return {"status": "sucesso", "message": "Conexão Supabase bem-sucedida!", "data": response.data}
-    except Exception as e:
-        print(f"ERROR: Failed to connect to Supabase: {e}")
-        raise HTTPException(status_code=500, detail=f"Erro ao conectar ao Supabase: {e}. Verifique as variáveis de ambiente e as credenciais.")
+        response = requests.post(url, headers=headers, data=data, auth=(account_sid, auth_token))
+        response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+        print(f"WhatsApp message sent successfully to {to}: {response.json()}")
+    except requests.exceptions.RequestException as e:
+        print(f"Error sending WhatsApp message to {to}: {e}")
 
+# --- Google Cloud Speech-to-Text Function ---
+def transcribe_audio_from_url(audio_url: str):
+    client = speech.SpeechClient() # Uses GOOGLE_APPLICATION_CREDENTIALS by default
+    
+    try:
+        response = requests.get(audio_url, stream=True)
+        response.raise_for_status() # Raise an exception for HTTP errors
+
+        audio_content = response.content
+
+        audio = speech.RecognitionAudio(content=audio_content)
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.OGG_OPUS, # Common for WhatsApp
+            sample_rate_hertz=16000, # Adjust if you know the sample rate
+            language_code="pt-BR",
+            model="default" # Or "enhanced" for better accuracy, if enabled
+        )
+
+        operation = client.long_running_recognize(config=config, audio=audio)
+        print("Waiting for audio transcription to complete...")
+        response = operation.result(timeout=300) # Wait for up to 5 minutes
+
+        transcripts = [result.alternatives[0].transcript for result in response.results]
+        return " ".join(transcripts) if transcripts else ""
+
+    except Exception as e:
+        print(f"Error during audio transcription: {e}")
+        return ""
 
 # --- WhatsApp Webhook Endpoint ---
-@app.post("/whatsapp_webhook")
+@app.post("/webhook")
 async def whatsapp_webhook(request: Request):
-    """
-    Handles incoming messages from WhatsApp via Twilio.
-    Processes text and voice messages, and interacts with Supabase.
-    """
     form_data = await request.form()
-    
-    from_number = form_data.get('From') # The sender's WhatsApp number (e.g., "whatsapp:+5511999999999")
-    message_body = form_data.get('Body', '').strip() # The text message body
-    num_media = int(form_data.get('NumMedia', 0)) # Number of media attachments
-    
-    # For WhatsApp, the user_id will be the 'From' number from Twilio.
-    whatsapp_user_id = from_number
+    message = Message(**form_data)
 
-    print(f"\n--- Mensagem Recebida do WhatsApp ---")
-    print(f"De: {whatsapp_user_id}")
-    print(f"Mensagem Bruta: '{message_body}'")
-    print(f"NumMedia: {num_media}")
-    print(f"------------------------------------\n")
+    from_number = message.From # e.g., "whatsapp:+5511999999999"
+    message_body = message.Body
+    media_url = message.MediaUrl0
 
-    # Call get_or_create_user to ensure the user exists in Supabase
+    print(f"Received message from: {from_number}")
+    print(f"Message body: {message_body}")
+    print(f"Media URL: {media_url}")
+
+    user_id = None
     try:
-        user_db_id = await get_or_create_user(whatsapp_user_id)
-        print(f"DEBUG: Usuário processado (ID Supabase): {user_db_id}")
-    except Exception as e:
-        error_message = f"Não foi possível processar seu usuário. Erro: {e}"
-        print(f"ERROR: {error_message}")
-        return create_twiml_response(error_message)
+        # Get or create user and get their Supabase ID
+        supabase_user_id = await get_or_create_user(from_number)
+        user_id = supabase_user_id # Store the user_id for later use if needed
 
+        # Fetch user's current vehicle information (assuming a 'veiculos' table)
+        # This is a placeholder, adapt to your actual vehicle data structure
+        vehicle_response = supabase.from_('veiculos').select('*').eq('user_id', user_id).limit(1).execute()
+        vehicle_data = vehicle_response.data
+        user_current_km = vehicle_data[0]['km_atual'] if vehicle_data else None
 
-    # Define common help message content
-    help_message_content = """Olá! 👋 Sou o Driverscash, seu assistente financeiro de viagem! 🚗💨
-Comandos de Receita 💰
-Faturamento Diario: Ex: Faturamento Diario 250.75
-Receita: Ex: Receita Corrida 80
-Faturamento Extra: Ex: Faturamento Extra Perfume 50
+        # Fetch active reminders for the user
+        reminders_table_path = f"artifacts/{app_id}/users/{user_id}/reminders"
+        reminders_response = supabase.from_(reminders_table_path).select('*').eq('status', 'Ativo').execute()
+        active_reminders = reminders_response.data
 
-Comandos de Despesa ⛽
-Abastecer: Ex: Abastecer 40 5.29 Gasolina 55000 (Litros ValorLitro TipoCombustivel KMAtual)
-Despesa: Ex: Despesa Manutencao 100
-Calcular Custo Combustivel: Ex: Calcular Custo Combustivel 100 10 6.50 (KM_Rodado Consumo_Medio Valor_Litro)
+        response_message = "Olá! Sou seu assistente de manutenção veicular. "
 
-Outros Comandos Uteis 🛣️
-KM: Ex: KM 12345
-Calcular Consumo: Ex: Calcular Consumo 10000 10500 50 (KM_Inicial KM_Final Litros_Consumidos)
-Relatorio KM: Ex: Relatorio KM
-Lembrete Manutencao: Ex: Lembrete Oleo KM 10000
-Lembrete Concluido: Ex: Lembrete Concluido Oleo
-Meus Lembretes: Ex: Meus Lembretes
-
-Relatorios Financeiros 📊
-Relatorio Semana Financeiro: Ex: Relatorio Semana Financeiro
-Relatorio Mes Financeiro: Ex: Relatorio Mes Financeiro
-"""
-    
-    # --- Speech-to-Text Processing for Voice Messages ---
-    if num_media > 0:
-        media_url = form_data.get('MediaUrl0') # Twilio typically provides MediaUrl0 for the first media
         if media_url:
-            print(f"DEBUG: Media detected. Media URL: {media_url}")
-            try:
-                audio_response = requests.get(media_url)
-                audio_response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+            transcribed_text = transcribe_audio_from_url(media_url)
+            print(f"Transcribed audio: {transcribed_text}")
+            message_body = transcribed_text # Use transcribed text as message body
 
-                audio_content = audio_response.content
-                audio = speech.RecognitionAudio(content=audio_content)
-                config = speech.RecognitionConfig(
-                    encoding=speech.RecognitionConfig.AudioEncoding.OGG_OPUS, # Common format for WhatsApp/Twilio
-                    sample_rate_hertz=16000, # Typical sample rate for phone audio
-                    language_code="pt-BR",   # Language code for Brazilian Portuguese
-                    # enable_automatic_punctuation=True # Optional: for automatic punctuation
-                )
+        if message_body:
+            lower_body = message_body.lower()
 
-                print("DEBUG: Sending audio to Speech-to-Text...")
-                stt_response = speech_client.recognize(config=config, audio=audio)
-                
-                if stt_response.results:
-                    # Get the first (most likely) transcription
-                    transcribed_text = stt_response.results[0].alternatives[0].transcript
-                    message_body = transcribed_text # Update message_body with transcribed text
-                    print(f"DEBUG: Audio transcribed to: '{transcribed_text}'")
-                else:
-                    message_body = "" # No transcription obtained
-                    print("DEBUG: No audio transcription was obtained.")
+            # --- Logic to handle different commands ---
+            if "olá" in lower_body or "oi" in lower_body or "iniciar" in lower_body:
+                response_message += "Como posso ajudar você hoje?"
+                response_message += "\n* Opções disponíveis:"
+                response_message += "\n* 'Adicionar Lembrete': Para adicionar uma nova manutenção."
+                response_message += "\n* 'Lembretes': Para ver suas manutenções agendadas."
+                response_message += "\n* 'Atualizar KM': Para informar a quilometragem atual do seu veículo."
+                response_message += "\n* 'Ajuda': Para ver este menu novamente."
 
-            except requests.exceptions.RequestException as req_err:
-                response_message = f"Erro ao descarregar áudio: {req_err}"
-                print(f"ERROR: {response_message}")
-                return create_twiml_response(response_message)
-            except Exception as stt_err:
-                response_message = f"Erro na transcrição de áudio: {stt_err}. Verifique a ativação da API e credenciais do Google Cloud."
-                print(f"ERROR: {response_message}")
-                return create_twiml_response(response_message)
-        else:
-            print("DEBUG: NumMedia > 0 but MediaUrl0 not found.")
-            response_message = "Mídia recebida, mas a URL do áudio não foi encontrada. Por favor, tente novamente ou use texto."
-            return create_twiml_response(response_message)
-
-    # Convert message body to lowercase for case-insensitive matching
-    processed_message_body = message_body.lower()
-    
-    # Handle 'Oi' and 'Ajuda' commands
-    if processed_message_body == 'oi':
-        initial_greeting = "Olá! Como posso ajudar a lançar seus registros hoje?"
-        combined_response = f"{initial_greeting}\n\n{help_message_content}"
-        return create_twiml_response(combined_response)
-
-    if processed_message_body == 'ajuda':
-        return create_twiml_response(help_message_content)
-
-    current_date = datetime.now().strftime("%Y-%m-%d")
-
-    # Supabase table paths for records and reminders for this specific WhatsApp user
-    # Following the pattern: artifacts/{appId}/users/{userId}/records (or reminders)
-    records_table_path = f"artifacts/{app_id}/users/{whatsapp_user_id}/records"
-    reminders_table_path = f"artifacts/{app_id}/users/{whatsapp_user_id}/reminders"
-
-    try:
-        # --- Process Expense Command ---
-        match_despesa = re.match(r'despesa\s+(?:de\s+)?([a-zA-ZáéíóúÁÉÍÓÚãõÃÕçÇ\s]+)\s+([\d\.,]+)', processed_message_body, re.IGNORECASE)
-        if match_despesa:
-            expense_type = match_despesa.group(1).strip().capitalize()
-            amount_str = match_despesa.group(2).replace(',', '.').strip()
-            try:
-                amount = float(amount_str)
-            except ValueError:
-                return create_twiml_response("Valor inválido para Despesa. Use 'Despesa Tipo Valor' com um número (ex: 150.50).")
+            elif "adicionar lembrete" in lower_body:
+                response_message = "Certo! Qual o tipo de manutenção (Ex: 'Troca de óleo', 'Revisão geral') e qual a KM alvo para ela (Ex: '20000')? Por favor, informe no formato: Tipo: [tipo], KM: [km_alvo]."
+                # Here you might set a state for the user to expect next input for reminder details
             
-            record_data = {
-                "user_id": whatsapp_user_id, # Storing user_id explicitly in the record
-                "origem": "WhatsApp",
-                "data": current_date,
-                "tipo_registro": "Despesa",
-                "categoria": expense_type,
-                "valor": amount,
-                "quantidade": None,
-                "observacoes": f"Registrado via WhatsApp por {whatsapp_user_id}"
-            }
-            supabase.from_(records_table_path).insert(record_data).execute()
-            return create_twiml_response(f"Despesa de {expense_type} no valor de R${amount:.2f} registada com sucesso!")
+            elif "tipo:" in lower_body and "km:" in lower_body:
+                try:
+                    match_type = re.search(r"tipo:\s*([^,]+)", lower_body)
+                    match_km = re.search(r"km:\s*(\d+)", lower_body)
 
-        # --- Process Income Command ---
-        match_receita = re.match(r'receita\s+(?:de\s+)?([a-zA-ZáéíóúÁÉÍÓÚãõÃÕçÇ\s]+)\s+([\d\.,]+)', processed_message_body, re.IGNORECASE)
-        if match_receita:
-            income_type = match_receita.group(1).strip().capitalize()
-            amount_str = match_receita.group(2).replace(',', '.').strip()
-            try:
-                amount = float(amount_str)
-            except ValueError:
-                return create_twiml_response("Valor inválido para Receita. Use 'Receita Tipo Valor' com um número (ex: 80.00).")
+                    if match_type and match_km:
+                        maintenance_type = match_type.group(1).strip()
+                        target_km = int(match_km.group(1).strip())
 
-            record_data = {
-                "user_id": whatsapp_user_id,
-                "origem": "WhatsApp",
-                "data": current_date,
-                "tipo_registro": "Receita",
-                "categoria": income_type,
-                "valor": amount,
-                "quantidade": None,
-                "observacoes": f"Registrado via WhatsApp por {whatsapp_user_id}"
-            }
-            supabase.from_(records_table_path).insert(record_data).execute()
-            return create_twiml_response(f"Receita de {income_type} no valor de R${amount:.2f} registada com sucesso!")
-
-        # --- Process Extra Income Command ---
-        match_faturamento_extra = re.match(r'faturamento\s+extra\s+(?:de\s+)?([a-zA-ZáéíóúÁÉÍÓÚãõÃÕçÇ\s]+)\s+([\d\.,]+)', processed_message_body, re.IGNORECASE)
-        if match_faturamento_extra:
-            extra_type = match_faturamento_extra.group(1).strip().capitalize()
-            amount_str = match_faturamento_extra.group(2).replace(',', '.').strip()
-            try:
-                amount = float(amount_str)
-            except ValueError:
-                return create_twiml_response("Valor inválido para Faturamento Extra. Use 'Faturamento Extra Tipo Valor' com um número (ex: 50.00).")
-
-            record_data = {
-                "user_id": whatsapp_user_id,
-                "origem": "WhatsApp",
-                "data": current_date,
-                "tipo_registro": "Receita",
-                "categoria": f"Extra: {extra_type}",
-                "valor": amount,
-                "quantidade": None,
-                "observacoes": f"Registrado via WhatsApp por {whatsapp_user_id}"
-            }
-            supabase.from_(records_table_path).insert(record_data).execute()
-            return create_twiml_response(f"Faturamento extra de {extra_type} no valor de R${amount:.2f} registado com sucesso!")
-
-        # --- Process Daily Income Command ---
-        match_faturamento_diario = re.match(r'(?:faturamento\s+diario|diario\s+faturamento)\s+([\d\.,]+)', processed_message_body, re.IGNORECASE)
-        if match_faturamento_diario:
-            amount_str = match_faturamento_diario.group(1).replace(',', '.').strip()
-            try:
-                amount = float(amount_str)
-            except ValueError:
-                return create_twiml_response("Valor inválido para Faturamento Diário. Use 'Faturamento Diario Valor' com um número (ex: 250.75).")
-
-            record_data = {
-                "user_id": whatsapp_user_id,
-                "origem": "WhatsApp",
-                "data": current_date,
-                "tipo_registro": "Receita",
-                "categoria": "Faturamento Diário",
-                "valor": amount,
-                "quantidade": None,
-                "observacoes": f"Registrado via WhatsApp por {whatsapp_user_id}"
-            }
-            supabase.from_(records_table_path).insert(record_data).execute()
-            return create_twiml_response(f"Faturamento diário de R${amount:.2f} registado com sucesso!")
-
-        # --- Process Detailed Fueling Command ---
-        # Abastecer 40 5.29 Gasolina 55000 (Litros ValorLitro TipoCombustivel KMAtual)
-        match_abastecer = re.match(r'abastecer\s+([\d\.,]+)\s+([\d\.,]+)\s+(gasolina|etanol)\s+([\d\.,]+)', processed_message_body, re.IGNORECASE)
-        if match_abastecer:
-            litros_str = match_abastecer.group(1).replace(',', '.').strip()
-            valor_litro_str = match_abastecer.group(2).replace(',', '.').strip()
-            tipo_combustivel = match_abastecer.group(3).strip().capitalize()
-            km_atual_str = match_abastecer.group(4).replace('.', '').replace(',', '.').strip() # Handle thousands separator
-
-            try:
-                litros = float(litros_str)
-                valor_litro = float(valor_litro_str)
-                km_atual = float(km_atual_str)
-            except ValueError:
-                return create_twiml_response("Formato inválido para Abastecer. Use 'Abastecer Litros ValorLitro TipoCombustivel KMAtual' (ex: Abastecer 40 5.29 Gasolina 55000).")
-
-            custo_total = litros * valor_litro
-
-            record_data = {
-                "user_id": whatsapp_user_id,
-                "origem": "WhatsApp",
-                "data": current_date,
-                "tipo_registro": "Despesa",
-                "categoria": f"Combustível - {tipo_combustivel}",
-                "valor": custo_total, # Total expense value
-                "quantidade": litros,      # Quantity (Liters)
-                "observacoes": f"KM Atual: {km_atual:.0f}, Valor Litro: R${valor_litro:.2f}. Registrado via WhatsApp por {whatsapp_user_id}"
-            }
-            supabase.from_(records_table_path).insert(record_data).execute()
-            return create_twiml_response(f"Abastecimento de {litros:.2f} Litros de {tipo_combustivel} (R${custo_total:.2f}) registado. KM atual: {km_atual:.0f}.")
-
-        # --- Process KM Command ---
-        match_km = re.match(r'km\s+([\d\.,]+)', processed_message_body, re.IGNORECASE)
-        if match_km:
-            km_value_str = match_km.group(1).replace('.', '').replace(',', '.').strip() # Handle thousands separator
-            try:
-                km_value = float(km_value_str)
-            except ValueError:
-                return create_twiml_response("Valor inválido para KM. Use 'KM Valor' com um número (ex: 12345).")
-            
-            record_data = {
-                "user_id": whatsapp_user_id,
-                "origem": "WhatsApp",
-                "data": current_date,
-                "tipo_registro": "KM",
-                "categoria": "Registro de KM",
-                "valor": km_value, # KM value stored in 'valor' field
-                "quantidade": None,
-                "observacoes": f"Registrado via WhatsApp por {whatsapp_user_id}"
-            }
-            supabase.from_(records_table_path).insert(record_data).execute()
-            
-            response_message = f"Registro de KM {km_value:.2f} efetuado com sucesso!"
-
-            # --- Maintenance Alert Logic (from Supabase) ---
-            try:
-                # Fetch all active reminders for this user
-                reminders_response = supabase.from_(reminders_table_path).select('tipo_manutencao, km_alvo').eq('user_id', whatsapp_user_id).eq('status', 'Ativo').execute()
-                all_reminders = reminders_response.data or []
-                
-                print(f"DEBUG: Maintenance Alert Logic - User: {whatsapp_user_id}, Current KM: {km_value}")
-                print(f"DEBUG: Maintenance Alert Logic - Total active reminders fetched: {len(all_reminders)}")
-
-                for reminder in all_reminders:
-                    print(f"DEBUG: Maintenance Alert Logic - Processing reminder: {reminder}")
-                    
-                    if isinstance(reminder.get('tipo_manutencao'), str) and isinstance(reminder.get('km_alvo'), (int, float)):
-                        tipo_manutencao_alerta = reminder.get('tipo_manutencao')
-                        target_km_reminder = float(reminder.get('km_alvo'))
-                        
-                        print(f"DEBUG: Maintenance Alert Logic - Active reminder found: Type='{tipo_manutencao_alerta}', Target={target_km_reminder}")
-
-                        ALERT_MARGIN = 500 # KM before target to send alert
-                        
-                        if km_value >= (target_km_reminder - ALERT_MARGIN) and km_value < target_km_reminder:
-                            alert_message = f"ALERTA! A manutenção de '{tipo_manutencao_alerta}' está a aproximar-se! Faltam aproximadamente {target_km_reminder - km_value:.0f} KM para o KM alvo de {target_km_reminder:.0f}."
-                            response_message += f"\n\n{alert_message}"
-                            print(f"MAINTENANCE ALERT TRIGGERED: {alert_message}")
-                        elif km_value >= target_km_reminder:
-                            alert_message = f"ALERTA! Você já passou do KM alvo de {target_km_reminder:.0f} para a manutenção de '{tipo_manutencao_alerta}'. Por favor, agende!"
-                            response_message += f"\n\n{alert_message}"
-                            print(f"MAINTENANCE ALERT TRIGGERED (PAST TARGET): {alert_message}")
+                        # Add the reminder to Supabase
+                        current_date = datetime.now().strftime("%Y-%m-%d")
+                        reminder_data = {
+                            "user_id": user_id,
+                            "tipo_manutencao": maintenance_type.capitalize(),
+                            "km_alvo": target_km,
+                            "data_configuracao": current_date,
+                            "status": "Ativo"
+                        }
+                        supabase.from_(reminders_table_path).insert(reminder_data).execute()
+                        response_message = f"Lembrete de '{maintenance_type}' para {target_km} KM adicionado com sucesso!"
                     else:
-                        print(f"DEBUG: Maintenance Alert Logic - Reminder ignored (missing keys or incorrect types): {reminder}")
-            except Exception as e_alert:
-                print(f"ERROR: Failed to check maintenance reminders in Supabase: {e_alert}")
-            # --- End of Maintenance Alert Logic ---
-            return create_twiml_response(response_message)
+                        response_message = "Formato inválido para adicionar lembrete. Use: Tipo: [tipo], KM: [km_alvo]."
+                except ValueError:
+                    response_message = "Formato de KM inválido. Use um número inteiro."
+                except Exception as e:
+                    response_message = f"Erro ao adicionar lembrete: {e}"
 
-        # --- Process Calculate Average Consumption Command ---
-        # Calcular Consumo 10000 10500 50 (KM_Inicial KM_Final Litros_Consumidos)
-        match_calcular_consumo = re.match(r'calcular\s+consumo\s+([\d\.,]+)\s+([\d\.,]+)\s+([\d\.,]+)', processed_message_body, re.IGNORECASE)
-        if match_calcular_consumo:
-            km_inicial_str = match_calcular_consumo.group(1).replace('.', '').replace(',', '.').strip()
-            km_final_str = match_calcular_consumo.group(2).replace('.', '').replace(',', '.').strip()
-            litros_consumidos_str = match_calcular_consumo.group(3).replace(',', '.').strip()
-            try:
-                km_inicial = float(km_inicial_str)
-                km_final = float(km_final_str)
-                litros_consumidos = float(litros_consumidos_str)
-            except ValueError:
-                return create_twiml_response("Formato inválido para Calcular Consumo. Use 'Calcular Consumo KM_Inicial KM_Final Litros_Consumidos' (ex: 10000 10500 50).")
-
-            if litros_consumidos > 0:
-                km_rodados = km_final - km_inicial
-                consumo_medio = km_rodados / litros_consumidos
-                response_message = f"Consumo médio calculado: {consumo_medio:.2f} KM/Litro."
-            else:
-                response_message = "Não é possível calcular o consumo médio com zero litros."
-            return create_twiml_response(response_message)
-
-        # --- Process Calculate Fuel Cost Command ---
-        # Calcular Custo Combustivel 100 10 6.50 (KM_Rodado Consumo_Medio Valor_Litro)
-        match_custo_combustivel = re.match(r'calcular\s+custo\s+combustivel\s+([\d\.,]+)\s+([\d\.,]+)\s+([\d\.,]+)', processed_message_body, re.IGNORECASE)
-        if match_custo_combustivel:
-            km_rodado_str = match_custo_combustivel.group(1).replace('.', '').replace(',', '.').strip()
-            consumo_medio_str = match_custo_combustivel.group(2).replace(',', '.').strip()
-            valor_litro_str = match_custo_combustivel.group(3).replace(',', '.').strip()
-
-            try:
-                km_rodado = float(km_rodado_str)
-                consumo_medio = float(consumo_medio_str)
-                valor_litro = float(valor_litro_str)
-            except ValueError:
-                return create_twiml_response("Formato inválido para Calcular Custo Combustivel. Use 'Calcular Custo Combustivel KM_Rodado Consumo_Medio Valor_Litro' (ex: 100 10 6.50).")
+            elif "lembretes" in lower_body:
+                if active_reminders:
+                    response_message = "Seus lembretes de manutenção ativos:\n"
+                    for r in active_reminders:
+                        response_message += f"- {r.get('tipo_manutencao')} (KM Alvo: {r.get('km_alvo')})\n"
+                else:
+                    response_message = "Você não tem lembretes de manutenção ativos no momento."
             
-            if consumo_medio > 0:
-                litros_necessarios = km_rodado / consumo_medio
-                custo_estimado = litros_necessarios * valor_litro
-                response_message = f"Custo estimado de combustível para {km_rodado:.0f} KM rodados (consumo {consumo_medio:.1f} KM/L, R${valor_litro:.2f}/L): R$ {custo_estimado:.2f}."
-            else:
-                response_message = "Consumo médio não pode ser zero para calcular o custo do combustível."
-            return create_twiml_response(response_message)
+            elif "atualizar km" in lower_body:
+                response_message = "Por favor, informe a quilometragem atual do seu veículo no formato: KM Atual: [seu_km]."
+                # Here you might set a state for the user to expect next input for KM update
 
-        # --- Process KM Report Command ---
-        match_relatorio_km_request = re.match(r'(?:relat[oó]rio\s+(?:de\s+)?km|km\s+relat[oó]rio)', processed_message_body, re.IGNORECASE)
-        if match_relatorio_km_request:
-            try:
-                # Fetch KM records for this user
-                records_response = supabase.from_(records_table_path).select('data, valor, tipo_registro').eq('user_id', whatsapp_user_id).eq('tipo_registro', 'KM').execute()
-                km_records = records_response.data or []
-                
-                total_km_semana = 0
-                total_km_mes = 0
-                
-                today = datetime.now().date()
-                start_of_week = today - timedelta(days=today.weekday()) # Monday of current week
-                start_of_month = today.replace(day=1) # First day of current month
-
-                for record in km_records:
-                    try:
-                        record_date_str = record.get('data')
-                        km_value_record = float(record.get('valor', 0))
-                        
-                        record_date = datetime.strptime(record_date_str, "%Y-%m-%d").date()
-                        
-                        if record_date >= start_of_week:
-                            total_km_semana += km_value_record
-                        
-                        if record_date >= start_of_month:
-                            total_km_mes += km_value_record
-                    except (ValueError, TypeError) as ve:
-                        print(f"ERROR: Failed to process KM record (date/value format): {record} - {ve}")
-                        continue
-
-                response_message = f"Relatório de KM:\n"
-                response_message += f"KM rodados esta semana: {total_km_semana:.2f}\n"
-                response_message += f"KM rodados este mês: {total_km_mes:.2f}"
-            except Exception as e_report:
-                response_message = f"Erro ao gerar relatório de KM: {e_report}"
-                print(f"ERROR: {response_message}")
-            return create_twiml_response(response_message)
-
-        # --- Process Maintenance Reminder Setup Command ---
-        # Lembrete Oleo KM 10000
-        match_lembrete_manutencao = re.match(r'lembrete\s+(?:de\s+)?([a-zA-ZáéíóúÁÉÍÓÚãõÃÕçÇ\s]+)\s+km\s+([\d\.,]+)', processed_message_body, re.IGNORECASE)
-        if match_lembrete_manutencao:
-            tipo_manutencao = match_lembrete_manutencao.group(1).strip().capitalize()
-            target_km_str = match_lembrete_manutencao.group(2).replace('.', '').replace(',', '.').strip() # Handle thousands separator
-            try:
-                target_km = float(target_km_str)
-            except ValueError:
-                return create_twiml_response("Valor de KM alvo inválido para Lembrete. Use 'Lembrete Tipo KM Valor' (ex: Lembrete Oleo KM 10000).")
-            
-            reminder_data = {
-                "user_id": whatsapp_user_id,
-                "tipo_manutencao": tipo_manutencao,
-                "km_alvo": target_km,
-                "data_configuracao": current_date,
-                "status": "Ativo"
-            }
-            supabase.from_(reminders_table_path).insert(reminder_data).execute()
-            return create_twiml_response(f"Lembrete de manutenção para '{tipo_manutencao}' configurado para o KM {target_km:.0f}. Você será notificado!")
-
-        # --- Process Mark Reminder as Completed Command ---
-        # Lembrete Concluido Oleo or Oleo Lembrete Concluido
-        tipo_manutencao_concluir = None
-        match_concluido_patterns = [
-            r'lembrete\s+concluido\s+([a-zA-ZáéíóúÁÉÍÓÚãõÃÕçÇ\s]+)',
-            r'([a-zA-ZáéíóúÁÉÍÓÚãõÃÕçÇ\s]+)\s+lembrete\s+concluido',
-            r'lembrete\s+de\s+([a-zA-ZáéíóúÁÉÍÓÚãõÃÕçÇ\s]+)\s+concluido',
-            r'([a-zA-ZáéíóúÁÉÍÓÚãõÃÕçÇ\s]+)\s+de\s+lembrete\s+concluido'
-        ]
-        for pattern in match_concluido_patterns:
-            match = re.match(pattern, processed_message_body, re.IGNORECASE)
-            if match:
-                tipo_manutencao_concluir = match.group(1).strip().capitalize()
-                break
-
-        if tipo_manutencao_concluir:
-            # Update the status of the active reminder for this user
-            # Supabase's update method can update rows matching a filter.
-            update_response = supabase.from_(reminders_table_path).update({'status': 'Concluído'}).eq('user_id', whatsapp_user_id).eq('tipo_manutencao', tipo_manutencao_concluir).eq('status', 'Ativo').execute()
-            
-            if update_response.data and len(update_response.data) > 0:
-                response_message = f"Lembrete de manutenção para '{tipo_manutencao_concluir}' marcado como concluído!"
-            else:
-                response_message = f"Nenhum lembrete de manutenção ativo para '{tipo_manutencao_concluir}' encontrado para marcar como concluído."
-            return create_twiml_response(response_message)
-
-        # --- Process List My Reminders Command ---
-        # Meus Lembretes
-        match_meus_lembretes = re.match(r'(?:meus\s+lembretes|lembretes\s+ativos|listar\s+lembretes)', processed_message_body, re.IGNORECASE)
-        if match_meus_lembretes:
-            reminders_response = supabase.from_(reminders_table_path).select('tipo_manutencao, km_alvo').eq('user_id', whatsapp_user_id).eq('status', 'Ativo').execute()
-            active_reminders = reminders_response.data or []
-            
-            if active_reminders:
-                response_message = "Seus Lembretes de Manutenção Ativos:\n"
-                for reminder in active_reminders:
-                    response_message += f"- {reminder.get('tipo_manutencao')}: KM Alvo {reminder.get('km_alvo'):.0f}\n"
-            else:
-                response_message = "Você não tem lembretes de manutenção ativos no momento."
-            return create_twiml_response(response_message)
-
-        # --- Process Weekly Financial Report Command ---
-        # Relatorio Semana Financeiro
-        match_relatorio_semanal_financeiro = re.match(r'relat[oó]rio\s+(?:semana\s+financeiro|financeiro\s+semanal)', processed_message_body, re_IGNORECASE)
-        if match_relatorio_semanal_financeiro:
-            records_response = supabase.from_(records_table_path).select('data, tipo_registro, valor, categoria').eq('user_id', whatsapp_user_id).execute()
-            all_records = records_response.data or []
-            
-            total_ganhos_semana = 0
-            total_despesas_semana = 0
-            despesas_por_categoria_semana = {}
-            
-            today = datetime.now().date()
-            start_of_week = today - timedelta(days=today.weekday()) # Monday of current week
-            end_of_week = start_of_week + timedelta(days=6) # Sunday of current week
-
-            for record in all_records:
+            elif "km atual:" in lower_body:
                 try:
-                    record_date_str = record.get('data')
-                    record_type = record.get('tipo_registro')
-                    record_value = float(str(record.get('valor', '0')))
-                    record_category = record.get('categoria', 'Outros')
+                    match_km_atual = re.search(r"km atual:\s*(\d+)", lower_body)
+                    if match_km_atual:
+                        new_km = int(match_km_atual.group(1).strip())
+                        # Update the user's current KM in Supabase (assuming 'veiculos' table)
+                        # This is a placeholder, adapt to your actual vehicle data structure
+                        if vehicle_data:
+                            supabase.from_('veiculos').update({'km_atual': new_km}).eq('user_id', user_id).execute()
+                            response_message = f"Sua quilometragem foi atualizada para {new_km} KM."
+                            # Now, check for overdue reminders
+                            overdue_reminders = []
+                            for r in active_reminders:
+                                if new_km >= r.get('km_alvo'):
+                                    overdue_reminders.append(r.get('tipo_manutencao'))
+                                    # Optionally, update reminder status to 'Concluído' or 'Vencido'
+                                    supabase.from_(reminders_table_path).update({'status': 'Vencido'}).eq('id', r.get('id')).execute()
+                            
+                            if overdue_reminders:
+                                response_message += "\n*Atenção*: As seguintes manutenções estão vencidas ou próximas:"
+                                for reminder_type in overdue_reminders:
+                                    response_message += f"\n- {reminder_type}"
+                        else:
+                            response_message = "Não encontramos informações de veículo para o seu usuário. Por favor, adicione seu veículo primeiro."
+                    else:
+                        response_message = "Formato inválido para KM Atual. Use: KM Atual: [seu_km]."
+                except ValueError:
+                    response_message = "Formato de KM inválido. Use um número inteiro."
+                except Exception as e:
+                    response_message = f"Erro ao atualizar KM: {e}"
 
-                    if record_date_str and record_type and record_value is not None:
-                        record_date = datetime.strptime(record_date_str, "%Y-%m-%d").date()
-
-                        if start_of_week <= record_date <= end_of_week:
-                            if record_type.strip().lower() == 'receita':
-                                total_ganhos_semana += record_value
-                            elif record_type.strip().lower() == 'despesa':
-                                total_despesas_semana += record_value
-                                despesas_por_categoria_semana[record_category] = despesas_por_categoria_semana.get(record_category, 0.0) + record_value
-                except (ValueError, TypeError) as ve:
-                    print(f"ERROR: Failed to process record for weekly report (date/value/type format): {record} - {ve}")
-                    continue
-            
-            lucro_semana = total_ganhos_semana - total_despesas_semana
-
-            report_parts = [
-                f"📊 Relatório Semanal ({start_of_week.strftime('%d/%m')} - {end_of_week.strftime('%d/%m')}) 📊",
-                f"Ganhos Totais: R$ {total_ganhos_semana:.2f}",
-                f"Despesas Totais: R$ {total_despesas_semana:.2f}",
-                f"Lucro: R$ {lucro_semana:.2f}",
-                "\n*Detalhes das Despesas por Categoria:*"
-            ]
-            
-            if despesas_por_categoria_semana:
-                for category, amount in despesas_por_categoria_semana.items():
-                    report_parts.append(f"- {category}: R$ {amount:.2f}")
+            elif "ajuda" in lower_body:
+                response_message += "Aqui estão as opções novamente:"
+                response_message += "\n* 'Adicionar Lembrete': Para adicionar uma nova manutenção."
+                response_message += "\n* 'Lembretes': Para ver suas manutenções agendadas."
+                response_message += "\n* 'Atualizar KM': Para informar a quilometragem atual do seu veículo."
+                response_message += "\n* 'Ajuda': Para ver este menu novamente."
             else:
-                report_parts.append("- Nenhuma despesa registada esta semana.")
+                response_message = "Não entendi sua solicitação. Por favor, tente 'Ajuda' para ver as opções."
+        else:
+            response_message = "Não consegui processar sua mensagem. Por favor, envie uma mensagem de texto ou tente novamente."
 
-            response_message = "\n".join(report_parts)
-            return create_twiml_response(response_message)
-
-        # --- Process Monthly Financial Report Command ---
-        # Relatorio Mes Financeiro
-        match_relatorio_mensal_financeiro = re.match(r'relat[oó]rio\s+(?:m[eê]s\s+financeiro|financeiro\s+mensal)', processed_message_body, re_IGNORECASE)
-        if match_relatorio_mensal_financeiro:
-            records_response = supabase.from_(records_table_path).select('data, tipo_registro, valor, categoria').eq('user_id', whatsapp_user_id).execute()
-            all_records = records_response.data or []
-            
-            total_ganhos_mes = 0
-            total_despesas_mes = 0
-            despesas_por_categoria_mes = {}
-            
-            today = datetime.now().date()
-            start_of_month = today.replace(day=1) # First day of current month
-            
-            meses_pt = [
-                "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
-                "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"
-            ]
-
-            for record in all_records:
-                try:
-                    record_date_str = record.get('data')
-                    record_type = record.get('tipo_registro')
-                    record_value = float(str(record.get('valor', '0')))
-                    record_category = record.get('categoria', 'Outros')
-
-                    if record_date_str and record_type and record_value is not None:
-                        record_date = datetime.strptime(record_date_str, "%Y-%m-%d").date()
-
-                        if record_date >= start_of_month and record_date.month == today.month and record_date.year == today.year:
-                            if record_type.strip().lower() == 'receita':
-                                total_ganhos_mes += record_value
-                            elif record_type.strip().lower() == 'despesa':
-                                total_despesas_mes += record_value
-                                despesas_por_categoria_mes[record_category] = despesas_por_categoria_mes.get(record_category, 0.0) + record_value
-                except (ValueError, TypeError) as ve:
-                    print(f"ERROR: Failed to process record for monthly report (date/value/type format): {record} - {ve}")
-                    continue
-            
-            lucro_mes = total_ganhos_mes - total_despesas_mes
-
-            report_parts = [
-                f"📊 Relatório Mensal ({meses_pt[start_of_month.month - 1]}/{start_of_month.year}) 📊",
-                f"Ganhos Totais: R$ {total_ganhos_mes:.2f}",
-                f"Despesas Totais: R$ {total_despesas_mes:.2f}",
-                f"Lucro: R$ {lucro_mes:.2f}",
-                "\n*Detalhes das Despesas por Categoria:*"
-            ]
-            
-            if despesas_por_categoria_mes:
-                for category, amount in despesas_por_categoria_mes.items():
-                    report_parts.append(f"- {category}: R$ {amount:.2f}")
-            else:
-                report_parts.append("- Nenhuma despesa registada este mês.")
-
-            response_message = "\n".join(report_parts)
-            return create_twiml_response(response_message)
-
-        # If no command matched
-        response_message = "Não consegui entender o comando. Por favor, verifique a mensagem de ajuda e tente novamente.\n\n" + help_message_content
-        return create_twiml_response(response_message)
-
+    except HTTPException as e:
+        response_message = f"Erro no serviço: {e.detail}"
+        print(f"HTTPException in webhook: {e.detail}")
     except Exception as e:
-        response_message = f"Erro inesperado ao processar sua mensagem: {e}"
-        print(f"ERROR: General webhook error: {e}")
-        return create_twiml_response(response_message)
+        response_message = f"Ocorreu um erro inesperado: {e}"
+        print(f"Unexpected error in webhook: {e}")
+
+    send_whatsapp_message(from_number, response_message)
+    return Response(content="<Response/>", media_type="text/xml")
 
 
-# --- Frontend API Endpoints (requiring authentication) ---
-
-# Endpoint to get all records for the authenticated user
-@app.get("/api/records")
-async def get_all_records_api(user_id: str = Depends(get_current_user_id_from_auth)):
-    """
-    Retrieves all records (expenses, incomes, KM) for the authenticated user from Supabase.
-    """
-    records_table_path = f"artifacts/{app_id}/users/{user_id}/records"
-    try:
-        # Fetch records filtered by user_id to ensure data isolation.
-        # Supabase client will ensure only data for this specific user_id in this path is returned.
-        response = supabase.from_(records_table_path).select('*').eq('user_id', user_id).execute()
-        return {"status": "sucesso", "data": response.data}
-    except Exception as e:
-        print(f"ERROR: Failed to fetch records from Supabase via API for user {user_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Erro ao obter registros: {e}")
-
-# Endpoint to add a new record via the frontend API
-@app.post("/api/records")
-async def add_record_api(record: RecordCreate, user_id: str = Depends(get_current_user_id_from_auth)):
-    """
-    Adds a new record (expense, income, or KM) for the authenticated user to Supabase.
-    """
-    records_table_path = f"artifacts/{app_id}/users/{user_id}/records"
-    current_date = datetime.now().strftime("%Y-%m-%d")
-    
-    record_data = {
-        "user_id": user_id, # Ensure user_id is stored with the record for RLS/filtering
-        "origem": "API Web",
-        "data": current_date,
-        "tipo_registro": record.type_of_record.capitalize(),
-        "categoria": record.category.capitalize(),
-        "valor": record.value,
-        "quantidade": record.quantity if record.quantity is not None else None,
-        "observacoes": record.observations if record.observations else "Registrado via API Web"
-    }
-    
-    try:
-        supabase.from_(records_table_path).insert(record_data).execute()
-        return {"status": "sucesso", "message": "Registro adicionado com sucesso via API web!"}
-    except Exception as e:
-        print(f"ERROR: Failed to add record to Supabase via API for user {user_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Erro ao adicionar registro via API: {e}")
-
-# Endpoint to get all maintenance reminders for the authenticated user
+# --- Endpoint for web frontend to get reminders ---
 @app.get("/api/reminders")
-async def get_all_reminders_api(user_id: str = Depends(get_current_user_id_from_auth)):
+async def get_reminders_api(user_id: str = Depends(get_current_user_id_from_auth)):
     """
-    Retrieves all maintenance reminders for the authenticated user from Supabase.
+    Fetches all reminders for the authenticated user from Supabase.
     """
-    reminders_table_path = f"artifacts/{app_id}/users/{user_id}/reminders"
     try:
+        # Define the dynamic table path for user-specific reminders
+        # Make sure 'app_id' is defined or passed correctly if used in path
+        # Assuming 'app_id' is a global or derived variable, for this example
+        # Let's assume app_id is a placeholder for a fixed string like 'drivercash_app' if used
+        app_id = "drivercash_app" # Example placeholder if it's a fixed app ID
+        
+        reminders_table_path = f"artifacts/{app_id}/users/{user_id}/reminders"
+        
         response = supabase.from_(reminders_table_path).select('*').eq('user_id', user_id).execute()
         return {"status": "sucesso", "data": response.data}
     except Exception as e:
@@ -838,6 +350,9 @@ async def add_reminder_api(reminder: ReminderCreate, user_id: str = Depends(get_
     """
     Adds a new maintenance reminder for the authenticated user to Supabase.
     """
+    # Assuming 'app_id' is defined as above
+    app_id = "drivercash_app" # Example placeholder if it's a fixed app ID
+
     reminders_table_path = f"artifacts/{app_id}/users/{user_id}/reminders"
     current_date = datetime.now().strftime("%Y-%m-%d")
     
@@ -851,7 +366,7 @@ async def add_reminder_api(reminder: ReminderCreate, user_id: str = Depends(get_
     
     try:
         supabase.from_(reminders_table_path).insert(reminder_data).execute()
-        return {"status": "sucesso", "message": "Lembrete adicionado com sucesso via API web!"}
+        return {"status": "sucesso", "message": "Lembrete adicionado com sucesso!"}
     except Exception as e:
         print(f"ERROR: Failed to add reminder to Supabase via API for user {user_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Erro ao adicionar lembrete via API: {e}
+        raise HTTPException(status_code=500, detail=f"Erro ao adicionar lembrete via API: {e}")
