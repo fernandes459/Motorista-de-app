@@ -1,11 +1,9 @@
 fastapi==0.111.0
 python-dotenv==1.0.0
-supabase==2.13
+supabase==2.13.0
 uvicorn==0.30.1
-twilio
-
-
-uvicorn==0.24.0
+twilio==9.6.3
 psycopg2-binary==2.9.7
 requests==2.31.0
 python-multipart==0.0.6
+google-cloud-speech==2.25.0  # Adicione esta linha se você usa Google Cloud Speech-to-Text
