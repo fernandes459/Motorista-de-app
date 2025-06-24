@@ -854,4 +854,4 @@ async def add_reminder_api(reminder: ReminderCreate, user_id: str = Depends(get_
         return {"status": "sucesso", "message": "Lembrete adicionado com sucesso via API web!"}
     except Exception as e:
         print(f"ERROR: Failed to add reminder to Supabase via API for user {user_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Erro ao adicionar lembrete via API: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro ao adicionar lembrete via API: {e}
